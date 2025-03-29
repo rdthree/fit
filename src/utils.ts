@@ -155,3 +155,23 @@ export function showUnappliedConflicts(clashedFiles: Array<ClashStatus>): void {
     conflictNotice.noticeEl.createEl("li", {cls: "file-conflict-note"})
         .setText("_fit folder is overwritten on conflict, copy needed changes outside _fit.")
 }
+
+export async function throttleAll<T, R>(
+	items: T[],
+	limit: number,
+	fn: (item: T) => Promise<R>
+): Promise<R[]> {
+	const results: R[] = []
+	let i = 0
+
+	async function next(): Promise<void> {
+		if (i >= items.length) return
+		const idx = i++
+		results[idx] = await fn(items[idx])
+		return next()
+	}
+
+	const workers = Array.from({ length: limit }, () => next())
+	await Promise.all(workers)
+	return results
+}

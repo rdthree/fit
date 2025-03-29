@@ -6,6 +6,7 @@ import { FitPull } from "./fitPull"
 import { FitPush } from "./fitPush"
 import { VaultOperations } from "./vaultOps"
 import { LocalStores } from "main"
+import { throttleAll } from "./utils"
 import FitNotice from "./fitNotice"
 
 export interface IFitSync {
@@ -169,10 +170,13 @@ export class FitSync implements IFitSync {
 
     async resolveConflicts(
         clashedFiles: Array<ClashStatus>, latestRemoteTreeSha: Record<string, string>)
-        : Promise<{noConflict: boolean, unresolvedFiles: ClashStatus[], fileOpsRecord: FileOpRecord[]}> {    
-            const fileResolutions = await Promise.all(
-                clashedFiles.map(clash=>{return this.resolveFileConflict(clash, latestRemoteTreeSha[clash.path])}))
-            const unresolvedFiles = fileResolutions.map((res, i)=> {
+        : Promise<{noConflict: boolean, unresolvedFiles: ClashStatus[], fileOpsRecord: FileOpRecord[]}> {
+		const fileResolutions = await throttleAll(
+			clashedFiles,
+			4,
+			clash => this.resolveFileConflict(clash, latestRemoteTreeSha[clash.path])
+		)
+		const unresolvedFiles = fileResolutions.map((res, i)=> {
                 if (!res.noDiff) {
                     return clashedFiles[i]
                 }
