@@ -1,10 +1,10 @@
 import { LocalStores, FitSettings } from "main"
 import { Octokit } from "@octokit/core"
-import { RECOGNIZED_BINARY_EXT, compareSha } from "./utils"
+import { RECOGNIZED_BINARY_EXT, compareSha, throttle } from "./utils"
 import { VaultOperations } from "./vaultOps"
 import { LocalChange, LocalFileStatus, RemoteChange, RemoteChangeType } from "./fitTypes"
 import { arrayBufferToBase64 } from "obsidian"
-
+import { Buffer } from 'buffer'; // Import Buffer for base64 conversion in getBlobs
 
 
 export type TreeNode = {
@@ -25,6 +25,7 @@ type OctokitCallMethods = {
     createCommit: (treeSha: string, parentSha: string) =>Promise<string>
     updateRef: (sha: string, ref: string) => Promise<string>
     getBlob: (file_sha:string) =>Promise<string>
+	getBranches: () => Promise<string[]>	
 }
 
 export interface IFit extends OctokitCallMethods{
@@ -39,6 +40,7 @@ export interface IFit extends OctokitCallMethods{
     octokit: Octokit
     vaultOps: VaultOperations
     fileSha1: (path: string) => Promise<string>
+	clearBlobCache: () => void; // Add method signature
 }
 
 // Define a custom HttpError class that extends Error
@@ -66,12 +68,17 @@ export class Fit implements IFit {
 	lastFetchedRemoteSha: Record<string, string>
     octokit: Octokit
     vaultOps: VaultOperations
-
+	// --- NEW: Blob Cache ---
+	private blobCache: Map<string, string>;
+	// --- NEW: Throttling state ---
+	private lastApiCallTimestamp: number = 0;
+	private apiCallIntervalMs: number = 150; // Minimum interval between API calls (adjust as needed)
 
     constructor(setting: FitSettings, localStores: LocalStores, vaultOps: VaultOperations) {
         this.loadSettings(setting)
         this.loadLocalStore(localStores)
         this.vaultOps = vaultOps
+		this.blobCache = new Map<string, string>(); // Initialize cache
         this.headers = {
             // Hack to disable caching which leads to inconsistency for
             // read after write https://github.com/octokit/octokit.js/issues/890
@@ -79,7 +86,34 @@ export class Fit implements IFit {
             'X-GitHub-Api-Version': '2022-11-28'
         }
     }
-    
+
+	// --- NEW: Method to clear cache before operations ---
+	clearBlobCache(): void {
+		this.blobCache.clear();
+		// console.log("Fit: Blob cache cleared."); // Optional logging
+	}
+
+	// --- NEW: Centralized API Request Throttler ---
+	private async throttledRequest<T>(requestFn: () => Promise<T>): Promise<T> {
+		const now = Date.now();
+		const timeSinceLastCall = now - this.lastApiCallTimestamp;
+		const delayNeeded = Math.max(0, this.apiCallIntervalMs - timeSinceLastCall);
+
+		if (delayNeeded > 0) {
+			// console.log(`Fit: Throttling API call by ${delayNeeded}ms`); // Optional logging
+			await throttle(delayNeeded); // Use utility throttle/sleep function
+		}
+
+		this.lastApiCallTimestamp = Date.now(); // Update timestamp *before* the call
+		try {
+			return await requestFn();
+		} catch (error) {
+			// Update timestamp even on error to prevent immediate retry burst
+			this.lastApiCallTimestamp = Date.now();
+			throw error; // Re-throw the original error
+		}
+	}
+	
     loadSettings(setting: FitSettings) {
         this.owner = setting.owner
         this.repo = setting.repo
@@ -129,10 +163,10 @@ export class Fit implements IFit {
 		)
 	}
 
-    async remoteUpdated(): Promise<{remoteCommitSha: string, updated: boolean}> {
-        const remoteCommitSha = await this.getLatestRemoteCommitSha()
-        return {remoteCommitSha, updated: remoteCommitSha !== this.lastFetchedCommitSha}
-    }
+	async remoteUpdated(): Promise<{remoteCommitSha: string, updated: boolean}> {
+		const remoteCommitSha = await this.getLatestRemoteCommitSha() // Uses throttled getRef
+		return {remoteCommitSha, updated: remoteCommitSha !== this.lastFetchedCommitSha}
+	}
 
     async getLocalChanges(currentLocalSha?: Record<string, string>): Promise<LocalChange[]> {
         if (!currentLocalSha) {
@@ -168,109 +202,128 @@ export class Fit implements IFit {
             })
     }
 
-    async getUser(): Promise<{owner: string, avatarUrl: string}> {
-        try {
-            const {data: response} = await this.octokit.request(
-                `GET /user`, {
-                    headers: this.headers
-            })
-            return {owner: response.login, avatarUrl:response.avatar_url}
-        } catch (error) {
-            throw new OctokitHttpError(error.message, error.status, "getUser");
-        }
-    }
+	// --- Apply Throttling to API Calls ---
 
-    async getRepos(): Promise<string[]> {
-        const allRepos: string[] = [];
-        let page = 1;
-        const perPage = 100; // Set to the maximum value of 100
+	async getUser(): Promise<{owner: string, avatarUrl: string}> {
+		return this.throttledRequest(async () => {
+			try {
+				const {data: response} = await this.octokit.request(
+					`GET /user`, {
+						headers: this.headers
+					})
+				return {owner: response.login, avatarUrl:response.avatar_url}
+			} catch (error) {
+				throw new OctokitHttpError(error.message, error.status, "getUser");
+			}
+		});
+	}
 
-        try {
-            let hasMorePages = true;
-            while (hasMorePages) {
-                const { data: response } = await this.octokit.request(
-                    `GET /user/repos`, {
-                    affiliation: "owner",
-                    headers: this.headers,
-                    per_page: perPage, // Number of repositories to import per page (up to 100)
-                    page: page
-                }
-                );
-                allRepos.push(...response.map(r => r.name));
+	async getRepos(): Promise<string[]> {
+		// This involves multiple requests in a loop, throttling applies to each page request
+		const allRepos: string[] = [];
+		let page = 1;
+		const perPage = 100;
 
-                // Make sure you have the following pages
-                if (response.length < perPage) {
-                    hasMorePages = false; // Exit when there are no more repositories
-                }
+		try {
+			let hasMorePages = true;
+			while (hasMorePages) {
+				const response = await this.throttledRequest(async () => {
+					return this.octokit.request(
+						`GET /user/repos`, {
+							affiliation: "owner",
+							headers: this.headers,
+							per_page: perPage,
+							page: page
+						}
+					);
+				});
+				allRepos.push(...response.data.map(r => r.name));
+				if (response.data.length < perPage) {
+					hasMorePages = false;
+				}
+				page++;
+			}
+			return allRepos;
+		} catch (error) {
+			throw new OctokitHttpError(error.message, error.status, "getRepos");
+		}
+	}
 
-                page++; // Go to the next page
-            }
+	async getBranches(): Promise<string[]> {
+		return this.throttledRequest(async () => {
+			try {
+				const {data: response} = await this.octokit.request(
+					`GET /repos/{owner}/{repo}/branches`,
+					{
+						owner: this.owner,
+						repo: this.repo,
+						headers: this.headers
+					})
+				return response.map(r => r.name)
+			} catch (error) {
+				throw new OctokitHttpError(error.message, error.status, "getBranches"); // Corrected source name
+			}
+		});
+	}
 
-            return allRepos;
-        } catch (error) {
-            throw new OctokitHttpError(error.message, error.status, "getRepos");
-        }
-    }
-
-    async getBranches(): Promise<string[]> {
-        try {
-            const {data: response} = await this.octokit.request(
-                `GET /repos/{owner}/{repo}/branches`, 
-                {
-                    owner: this.owner,
-                    repo: this.repo,
-                    headers: this.headers
-            })
-            return response.map(r => r.name)
-        } catch (error) {
-            throw new OctokitHttpError(error.message, error.status, "getRepos");
-        }
-    }
-
-    async getRef(ref: string): Promise<string> {
-        try {
-            const {data: response} = await this.octokit.request(
-                `GET /repos/{owner}/{repo}/git/ref/{ref}`, {
-                    owner: this.owner,
-                    repo: this.repo,
-                    ref: ref,
-                    headers: this.headers
-            })
-            return response.object.sha
-        } catch (error) {
-            throw new OctokitHttpError(error.message, error.status, "getRef");
-        }
-    }
+	async getRef(ref: string): Promise<string> {
+		return this.throttledRequest(async () => {
+			try {
+				const {data: response} = await this.octokit.request(
+					`GET /repos/{owner}/{repo}/git/ref/{ref}`, {
+						owner: this.owner,
+						repo: this.repo,
+						ref: ref,
+						headers: this.headers
+					})
+				return response.object.sha
+			} catch (error) {
+				// Handle ref not found (404) gracefully if needed, e.g., return null
+				if (error.status === 404) {
+					console.warn(`Ref ${ref} not found in ${this.owner}/${this.repo}`);
+					// Depending on context, you might want to return null or a specific indicator
+				}
+				throw new OctokitHttpError(error.message, error.status, "getRef");
+			}
+		});
+	}
 
     // Get the sha of the latest commit in the default branch (set by user in setting)
-    async getLatestRemoteCommitSha(ref = `heads/${this.branch}`): Promise<string> {
-        return await this.getRef(ref)
-    }
+	async getLatestRemoteCommitSha(ref = `heads/${this.branch}`): Promise<string> {
+		return this.getRef(ref) // Already throttled via getRef
+	}
 
-    // ref Can be a commit SHA, branch name (heads/BRANCH_NAME), or tag name (tags/TAG_NAME), 
-    // refers to https://git-scm.com/book/en/v2/Git-Internals-Git-References
-    async getCommitTreeSha(ref: string): Promise<string> {
-        const {data: commit} =  await this.octokit.request( 
-            `GET /repos/{owner}/{repo}/commits/{ref}`, {
-            owner: this.owner,
-            repo: this.repo,
-            ref,
-            headers: this.headers
-        })
-        return commit.commit.tree.sha
-    }
+	async getCommitTreeSha(ref: string): Promise<string> {
+		return this.throttledRequest(async () => {
+			const {data: commit} =  await this.octokit.request(
+				`GET /repos/{owner}/{repo}/commits/{ref}`, {
+					owner: this.owner,
+					repo: this.repo,
+					ref,
+					headers: this.headers
+				})
+			return commit.commit.tree.sha
+		});
+	}
 
-    async getTree(tree_sha: string): Promise<TreeNode[]> {
-        const { data: tree } =  await this.octokit.request(
-            `GET /repos/{owner}/{repo}/git/trees/{tree_sha}`, {
-            owner: this.owner,
-            repo: this.repo,
-            tree_sha,
-            recursive: 'true',
-            headers: this.headers
-        })
-        return tree.tree as TreeNode[]
-    }
+	async getTree(tree_sha: string): Promise<TreeNode[]> {
+		return this.throttledRequest(async () => {
+			const { data: tree } =  await this.octokit.request(
+				`GET /repos/{owner}/{repo}/git/trees/{tree_sha}`, {
+					owner: this.owner,
+					repo: this.repo,
+					tree_sha,
+					recursive: 'true', // Be mindful: recursive can be large!
+					headers: this.headers
+				})
+			// Consider adding pagination or using compare API if trees get too large
+			if (tree.truncated) {
+				console.warn(`Fit: Fetched tree ${tree_sha} was truncated. Results may be incomplete. Consider using the compare API for large repos.`);
+				// Potentially throw an error or notify the user more prominently
+			}
+			return tree.tree as TreeNode[]
+		});
+	}
 
     // get the remote tree sha in the format compatible with local store
     async getRemoteTreeSha(tree_sha: string): Promise<{[k:string]: string}> {
@@ -291,17 +344,19 @@ export class Fit implements IFit {
         return remoteSha
     }
 
-    async createBlob(content: string, encoding: string): Promise<string> {
-        const {data: blob} = await this.octokit.request(
-            `POST /repos/{owner}/{repo}/git/blobs`, {
-            owner: this.owner,
-            repo: this.repo,
-            content, 
-            encoding,
-            headers: this.headers     
-        })
-        return blob.sha
-    }
+	async createBlob(content: string, encoding: string): Promise<string> {
+		return this.throttledRequest(async () => {
+			const {data: blob} = await this.octokit.request(
+				`POST /repos/{owner}/{repo}/git/blobs`, {
+					owner: this.owner,
+					repo: this.repo,
+					content,
+					encoding,
+					headers: this.headers
+				})
+			return blob.sha
+		});
+	}
 
 
     async createTreeNodeFromFile({path, status, extension}: LocalChange, remoteTree: Array<TreeNode>): Promise<TreeNode|null> {
@@ -330,12 +385,13 @@ export class Fit implements IFit {
 			for (let i = 0; i < uint8Array.length; i++) {
 				binaryString += String.fromCharCode(uint8Array[i]);
 			}
-			content = btoa(binaryString);
+			// Use Buffer for reliable base64 encoding, especially in Node-like envs (Obsidian desktop)
+			content = Buffer.from(fileArrayBuf).toString('base64');
 		} else {
 			encoding = 'utf-8'
 			content = await this.vaultOps.vault.read(file)
 		}
-		const blobSha = await this.createBlob(content, encoding)
+		const blobSha = await this.createBlob(content, encoding) // Throttled call
         // skip creating node if file found on remote is the same as the created blob
         if (remoteTree.some(node => node.path === path && node.sha === blobSha)) {
             return null
@@ -348,95 +404,160 @@ export class Fit implements IFit {
 		}
 	}
 
-    async createTree(
-        treeNodes: Array<TreeNode>,
-        base_tree_sha: string): 
-        Promise<string> {
-            const {data: newTree} = await this.octokit.request(
-                `POST /repos/{owner}/{repo}/git/trees`, 
-                {
-                    owner: this.owner,
-                    repo: this.repo,
-                    tree: treeNodes,
-                    base_tree: base_tree_sha,
-                    headers: this.headers
-                }
-            )
-            return newTree.sha
-    }
+	async createTree(treeNodes: Array<TreeNode>, base_tree_sha: string): Promise<string> {
+		return this.throttledRequest(async () => {
+			const {data: newTree} = await this.octokit.request(
+				`POST /repos/{owner}/{repo}/git/trees`,
+				{
+					owner: this.owner,
+					repo: this.repo,
+					tree: treeNodes,
+					base_tree: base_tree_sha,
+					headers: this.headers
+				}
+			)
+			return newTree.sha
+		});
+	}
 
-    async createCommit(treeSha: string, parentSha: string): Promise<string> {
-        const message = `Commit from ${this.deviceName} on ${new Date().toLocaleString()}`
-        const { data: createdCommit } = await this.octokit.request(
-            `POST /repos/{owner}/{repo}/git/commits` , {
-            owner: this.owner,
-            repo: this.repo,
-            message,
-            tree: treeSha,
-            parents: [parentSha],
-            headers: this.headers
-        })
-        return createdCommit.sha
-    }
+	async createCommit(treeSha: string, parentSha: string): Promise<string> {
+		return this.throttledRequest(async () => {
+			const message = `Commit from ${this.deviceName} on ${new Date().toLocaleString()}`
+			const { data: createdCommit } = await this.octokit.request(
+				`POST /repos/{owner}/{repo}/git/commits` , {
+					owner: this.owner,
+					repo: this.repo,
+					message,
+					tree: treeSha,
+					parents: [parentSha],
+					headers: this.headers
+				})
+			return createdCommit.sha
+		});
+	}
 
-    async updateRef(sha: string, ref = `heads/${this.branch}`): Promise<string> {
-        const { data:updatedRef } = await this.octokit.request(
-            `PATCH /repos/{owner}/{repo}/git/refs/{ref}`, {
-            owner: this.owner,
-            repo: this.repo,
-            ref,
-            sha,
-            headers: this.headers
-        })
-        return updatedRef.object.sha
-    }
+	async updateRef(sha: string, ref = `heads/${this.branch}`): Promise<string> {
+		return this.throttledRequest(async () => {
+			const { data:updatedRef } = await this.octokit.request(
+				`PATCH /repos/{owner}/{repo}/git/refs/{ref}`, {
+					owner: this.owner,
+					repo: this.repo,
+					ref,
+					sha,
+					headers: this.headers
+				})
+			return updatedRef.object.sha
+		});
+	}
 
-    async getBlob(file_sha:string): Promise<string> {
-        const { data: blob } = await this.octokit.request(
-            `GET /repos/{owner}/{repo}/git/blobs/{file_sha}`, {
-            owner: this.owner,
-            repo: this.repo,
-            file_sha,
-            headers: this.headers
-        })
-        return blob.content
-    }
+	// --- MODIFIED: getBlob - Use Cache First ---
+	async getBlob(file_sha:string): Promise<string> {
+		// 1. Check cache
+		if (this.blobCache.has(file_sha)) {
+			// console.log(`Fit: Cache hit for blob ${file_sha}`); // Optional logging
+			return this.blobCache.get(file_sha) as string;
+		}
+
+		// 2. Fetch if not in cache (throttled)
+		// console.log(`Fit: Cache miss for blob ${file_sha}, fetching...`); // Optional logging
+		return this.throttledRequest(async () => {
+			try {
+				const { data: blob } = await this.octokit.request(
+					`GET /repos/{owner}/{repo}/git/blobs/{file_sha}`, {
+						owner: this.owner,
+						repo: this.repo,
+						file_sha,
+						headers: this.headers
+					});
+
+				// 3. Store in cache BEFORE returning
+				this.blobCache.set(file_sha, blob.content);
+				return blob.content;
+			} catch (error) {
+				// Handle blob not found (404/422) gracefully if needed
+				if (error.status === 404 || error.status === 422) {
+					console.warn(`Blob ${file_sha} not found in ${this.owner}/${this.repo}`);
+					// Return null or empty string, or rethrow depending on expected behavior
+					return ""; // Example: return empty string
+				}
+				throw new OctokitHttpError(error.message, error.status, "getBlob");
+			}
+		});
+	}
 
 	// NEW FUNCTION: Bundled blob retrieval using GraphQL
+	// --- MODIFIED: getBlobs (GraphQL) - Use and Populate Cache ---
 	async getBlobs(blobSHAs: string[]): Promise<{ [sha: string]: string }> {
-		// Convert each blob SHA into its global node ID.
-		// GitHub’s pattern is to prefix with "010blob" and then base64 encode.
-		const ids = blobSHAs.map(sha =>
-			Buffer.from('010blob' + sha).toString('base64')
+		const neededSHAs = blobSHAs.filter(sha => !this.blobCache.has(sha));
+		const results: { [sha: string]: string } = {};
+
+		// Populate results from cache first
+		blobSHAs.forEach(sha => {
+			if (this.blobCache.has(sha)) {
+				results[sha] = this.blobCache.get(sha) as string;
+			}
+		});
+
+		if (neededSHAs.length === 0) {
+			// console.log("Fit: All blobs requested were already in cache."); // Optional logging
+			return results;
+		}
+
+		// console.log(`Fit: Fetching ${neededSHAs.length} blobs via GraphQL.`); // Optional logging
+
+		// Convert needed SHAs to GraphQL node IDs
+		// Use Buffer for reliable base64 encoding
+		const ids = neededSHAs.map(sha =>
+				Buffer.from(`blob:${sha}`).toString('base64') // Standard GraphQL ID format for blobs might vary, check docs/experiment. Common is `blob:<sha>` or repo-specific prefix. Let's assume `blob:<sha>` for now. Adjust if needed.
+			// Alternative common format: `010blob${sha}` -> Buffer.from(`010blob${sha}`).toString('base64')
 		);
 
-		// Build the GraphQL query. This uses the 'nodes' field to fetch multiple objects by ID.
+
+		// Build the GraphQL query
 		const query = `
         query ($ids: [ID!]!) {
             nodes(ids: $ids) {
                 ... on Blob {
-                    oid
-                    text
+                    oid # The SHA
+                    byteSize # Good to check if needed
+                    text # Content for text files
+                    isBinary # To know if we need to handle base64
+                    # If handling binary: might need different fields or handle 'text' as base64
                 }
             }
         }
-    `;
+        `; // Note: `text` might return null for binary files. GitHub GraphQL might require different handling/fields for binary content retrieval if `text` doesn't provide base64. Check API docs. Assuming `text` provides UTF-8 or Base64 for now.
+
 		const variables = { ids };
 
-		// Call the GraphQL endpoint via octokit.
-		// Note: Octokit supports GraphQL via `octokit.graphql(query, variables)`
-		const response: { nodes: Array<{ oid: string; text: string } | null> } =
-			await this.octokit.graphql(query, variables);
+		// Call the GraphQL endpoint (throttled)
+		const response: { nodes: Array<{ oid: string; text: string; isBinary: boolean } | null> } =
+			await this.throttledRequest(() => this.octokit.graphql(query, variables));
 
-		// Map the results: use the oid (which should match your original SHA) as key.
-		const blobs: { [sha: string]: string } = {};
+		// Process results and update cache
 		response.nodes.forEach(node => {
-			if (node && node.oid && node.text) {
-				// node.oid should equal the original SHA if the conversion is correct.
-				blobs[node.oid] = node.text;
+			if (node && node.oid && node.text !== null) { // Check text is not null
+				const content = node.text; // Assuming text is the content (UTF-8 or Base64 if binary was requested appropriately)
+				results[node.oid] = content;
+				this.blobCache.set(node.oid, content); // Update cache
+			} else if (node && node.oid) {
+				// Handle cases where text is null (e.g., potentially large binary files not retrieved via 'text')
+				console.warn(`Fit: GraphQL node for SHA ${node.oid} returned null text. Content might be binary or too large for this query field.`);
+				// Mark as fetched but empty in cache, or leave out? Let's mark empty for now.
+				results[node.oid] = ""; // Indicate fetch attempt but no content retrieved
+				this.blobCache.set(node.oid, "");
 			}
 		});
-		return blobs;
-	}
 
+		// Check if any requested SHAs were not returned by GraphQL (e.g., invalid ID format, non-existent blobs)
+		neededSHAs.forEach(sha => {
+			if (!(sha in results)) {
+				console.warn(`Fit: Blob SHA ${sha} requested via GraphQL but not found in response.`);
+				results[sha] = ""; // Or handle as error
+				this.blobCache.set(sha, ""); // Cache the miss
+			}
+		});
+
+		return results;
+	}
 }

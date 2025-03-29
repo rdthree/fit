@@ -175,3 +175,8 @@ export async function throttleAll<T, R>(
 	await Promise.all(workers)
 	return results
 }
+
+// NEW: Simple throttle/sleep utility
+export function throttle(ms: number): Promise<void> {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}

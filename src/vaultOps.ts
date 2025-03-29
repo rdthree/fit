@@ -1,6 +1,6 @@
 import { TFile, Vault, base64ToArrayBuffer } from "obsidian";
 import { FileOpRecord } from "./fitTypes";
-
+import { Buffer } from 'buffer'; // Use Buffer for robust encoding/decoding
 
 export interface IVaultOperations {
     vault: Vault
@@ -51,56 +51,87 @@ export class VaultOperations implements IVaultOperations {
         }
     }
 
-    async writeToLocal(path: string, content: string): Promise<FileOpRecord> {
-        // adopted getAbstractFileByPath for mobile compatiability
-        // TODO: add capability for creating folder from remote
-        const file = this.vault.getAbstractFileByPath(path)
-        if (file && file instanceof TFile) {
-            await this.vault.modifyBinary(file, base64ToArrayBuffer(content))
-            return {path, status: "changed"}
-        } else if (!file) {
-            this.ensureFolderExists(path)
-            await this.vault.createBinary(path, base64ToArrayBuffer(content))
-            return {path, status: "created"}
-        } 
-            throw new Error(`${path} writeToLocal operation unsuccessful, vault abstractFile on ${path} is of type ${typeof file}`);
-    }
+	// --- Ensure this handles base64 input correctly ---
+	async writeToLocal(path: string, contentBase64: string): Promise<FileOpRecord> {
+		const file = this.vault.getAbstractFileByPath(path);
+		let arrayBuffer: ArrayBuffer;
+		try {
+			// Use Buffer for robust conversion
+			arrayBuffer = base64ToArrayBuffer(contentBase64);
+		} catch (e) {
+			console.error(`Error decoding base64 for path: ${path}`, e);
+			// Decide how to handle invalid base64 - skip write, write empty, throw?
+			// Throwing might be safest to alert about data corruption.
+			throw new Error(`Invalid base64 content received for ${path}`);
+		}
 
-    async updateLocalFiles(
-        addToLocal: {path: string, content: string}[], 
-        deleteFromLocal: Array<string>): Promise<FileOpRecord[]> {
-            // Process file additions or updates
-            const writeOperations = addToLocal.map(async ({path, content}) => {
-                return await this.writeToLocal(path, content)
-            });
-        
-            // Process file deletions
-            const deletionOperations = deleteFromLocal.map(async (path) => {
-                return await this.deleteFromLocal(path)
-            });
-            const fileOps = await Promise.all([...writeOperations, ...deletionOperations]);
-            return fileOps
-    }
 
-    async createCopyInDir(path: string, copyDir = "_fit"): Promise<void> {
-        const file = this.vault.getAbstractFileByPath(path)
-        if (file && file instanceof TFile) {
-            const copy = await this.vault.readBinary(file)
-            const copyPath = `${copyDir}/${path}`
-            this.ensureFolderExists(copyPath)
-            const copyFile = this.vault.getAbstractFileByPath(path)
-            if (copyFile && copyFile instanceof TFile) {
-                await this.vault.modifyBinary(copyFile, copy)
-            } else if (!copyFile) {
-                await this.vault.createBinary(copyPath, copy)
-            } else {
-                this.vault.delete(copyFile, true) // TODO add warning to let user know files in _fit will be overwritten
-                await this.vault.createBinary(copyPath, copy)
-            }
-            await this.vault.createBinary(copyPath, copy)
-        } else {
-            throw new Error(`Attempting to create copy of ${path} from local drive as TFile but not successful,
-            file is of type ${typeof file}.`)
-        }
-    }
+		try {
+			if (file instanceof TFile) {
+				await this.vault.modifyBinary(file, arrayBuffer);
+				return {path, status: "changed"};
+			} else if (!file) {
+				await this.ensureFolderExists(path); // Ensure parent folder exists
+				await this.vault.createBinary(path, arrayBuffer);
+				return {path, status: "created"};
+			} else {
+				// Path exists but is a folder, or something else unexpected
+				console.error(`Cannot write file content to ${path}, it exists but is not a TFile (Type: ${file?.constructor.name})`);
+				throw new Error(`Cannot write file to ${path} as it's not a file.`);
+			}
+		} catch (vaultError) {
+			console.error(`Vault operation failed for ${path}:`, vaultError);
+			throw vaultError; // Re-throw vault errors
+		}
+	}
+
+	async updateLocalFiles(
+		addToLocal: {path: string, content: string}[], // content is base64
+		deleteFromLocal: Array<string>): Promise<FileOpRecord[]> {
+		// Process writes (content is base64)
+		const writeOpsPromises = addToLocal.map(({path, content}) =>
+			this.writeToLocal(path, content).catch(e => {
+				console.error(`Failed write operation for ${path}:`, e);
+				return null; // Return null on error to filter out later
+			})
+		);
+
+		// Process deletions
+		const deleteOpsPromises = deleteFromLocal.map((path) =>
+			this.deleteFromLocal(path).catch(e => {
+				console.error(`Failed delete operation for ${path}:`, e);
+				return null; // Return null on error
+			})
+		);
+
+		const results = await Promise.all([...writeOpsPromises, ...deleteOpsPromises]);
+		// Filter out null results from failed operations
+		return results.filter(op => op !== null) as FileOpRecord[];
+	}
+
+	// --- Ensure createCopyInDir handles binary correctly ---
+	async createCopyInDir(path: string, copyDir = "_fit"): Promise<void> {
+		const file = await this.getTFile(path); // Use ensured TFile getter
+		const copyData = await this.vault.readBinary(file);
+		const copyPath = `${copyDir}/${path}`;
+
+		await this.ensureFolderExists(copyPath); // Ensure target folder exists
+
+		const existingCopy = this.vault.getAbstractFileByPath(copyPath);
+		try {
+			if (existingCopy instanceof TFile) {
+				await this.vault.modifyBinary(existingCopy, copyData);
+			} else if (!existingCopy) {
+				await this.vault.createBinary(copyPath, copyData);
+			} else {
+				// Target path exists but isn't a file (e.g., folder)
+				console.warn(`Cannot create copy at ${copyPath}, path exists but is not a file. Deleting and recreating.`);
+				await this.vault.delete(existingCopy, true); // Force delete folder/other
+				await this.vault.createBinary(copyPath, copyData);
+			}
+		} catch (e) {
+			console.error(`Failed to create copy of ${path} at ${copyPath}:`, e);
+			throw e; // Re-throw error
+		}
+	}
 }
