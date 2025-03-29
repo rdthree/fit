@@ -489,100 +489,91 @@ export class Fit implements IFit {
 	// --- MODIFIED: getBlobs (GraphQL) - Use and Populate Cache ---
 // --- MODIFIED: getBlobs (GraphQL) - Added Batching for 100 ID Limit ---
 	async getBlobs(blobSHAs: string[]): Promise<{ [sha: string]: string }> {
-		// Filter out invalid SHAs early (e.g., empty strings or nulls if they somehow slip in)
-		const validBlobSHAs = blobSHAs.filter(sha => sha && typeof sha === 'string' && sha.length > 0);
-
+		const validBlobSHAs = blobSHAs.filter(sha => sha && typeof sha === 'string' && sha.length === 40); // Basic SHA format check
 		const neededSHAs = validBlobSHAs.filter(sha => !this.blobCache.has(sha));
 		const results: { [sha: string]: string } = {};
 
-		// Populate results from cache first
 		validBlobSHAs.forEach(sha => {
 			if (this.blobCache.has(sha)) {
 				results[sha] = this.blobCache.get(sha) as string;
 			}
 		});
 
-		if (neededSHAs.length === 0) {
-			// console.log("Fit: All blobs requested were already in cache.");
-			return results;
-		}
+		if (neededSHAs.length === 0) { return results; }
 
 		console.log(`Fit: Need to fetch ${neededSHAs.length} blobs via GraphQL.`);
+		const BATCH_SIZE = 95;
 
-		// --- Batching Logic ---
-		const BATCH_SIZE = 95; // Stay safely under the 100 limit
 		for (let i = 0; i < neededSHAs.length; i += BATCH_SIZE) {
 			const batchSHAs = neededSHAs.slice(i, i + BATCH_SIZE);
-			console.log(`Fit: Fetching GraphQL batch ${Math.floor(i / BATCH_SIZE) + 1} with ${batchSHAs.length} IDs.`);
+			const batchStartIndex = i; // For logging context
+			console.log(`Fit: Fetching GraphQL batch ${Math.floor(i / BATCH_SIZE) + 1} with ${batchSHAs.length} SHAs.`);
 
-			// Convert batch SHAs to GraphQL node IDs
+			// --- Use '04blob' prefix for Node ID ---
 			const ids = batchSHAs.map(sha =>
-				Buffer.from(`blob:${sha}`).toString('base64') // Assuming this format is correct
+				Buffer.from(`04blob${sha}`).toString('base64') // Changed prefix
 			);
 
-			// Build the GraphQL query
 			const query = `
             query ($ids: [ID!]!) {
                 nodes(ids: $ids) {
-                    ... on Blob {
-                        oid # The SHA
-                        # byteSize
-                        text # Content for text files (may be null for binary)
-                        isBinary
-                    }
+                    ... on Blob { oid, text, isBinary }
                 }
             }`;
 			const variables = { ids };
 
 			try {
-				// Call the GraphQL endpoint (throttled automatically by throttledRequest)
 				const response: { nodes: Array<{ oid: string; text: string | null; isBinary: boolean } | null> } =
 					await this.throttledRequest(() => this.octokit.graphql(query, variables));
 
-				// Process results for this batch and update cache
+				const returnedOids = new Set<string>();
 				response.nodes.forEach(node => {
 					if (node?.oid) {
-						const content = node.text ?? ""; // Default to empty if text is null
+						returnedOids.add(node.oid); // Track successfully returned OIDs (SHAs)
+						const content = node.text ?? "";
 						results[node.oid] = content;
 						this.blobCache.set(node.oid, content);
 						if (node.text === null) {
-							console.warn(`Fit: GraphQL node for SHA ${node.oid} returned null text. Content might be binary or too large.`);
+							console.warn(`Fit: GraphQL node for SHA ${node.oid} returned null text.`);
 						}
 					}
 				});
 
-				// Check for any SHAs in the *batch* that weren't returned
+				// Identify SHAs requested in this batch but *not* returned successfully
 				batchSHAs.forEach(sha => {
-					if (!(sha in results)) {
-						// This might happen if the blob ID format was wrong, or the blob truly doesn't exist
-						console.warn(`Fit: Blob SHA ${sha} from batch not found in GraphQL response.`);
-						results[sha] = ""; // Mark as fetched but empty/not found
+					if (!returnedOids.has(sha)) {
+						console.warn(`Fit: Blob SHA ${sha} from batch (start index ${batchStartIndex}) not found or failed in GraphQL response.`);
+						results[sha] = ""; // Mark as empty/not found
 						this.blobCache.set(sha, "");
 					}
 				});
 
 			} catch (error) {
-				console.error(`Fit: GraphQL batch fetch failed (Batch starting index ${i}):`, error);
-				// Mark all SHAs in this *failed batch* as empty in results and cache to avoid retrying them individually
+				// Catch potential GraphqlResponseError specifically if available from octokit types
+				// or just catch generic Error
+				console.error(`Fit: GraphQL batch fetch failed (Batch starting index ${batchStartIndex}):`, error);
+
+				// Log the specific SHAs that might have caused the issue IF the error message provides clues
+				// (The current error *does* list the failed IDs, but parsing them back isn't trivial/reliable here)
+				console.error(`Failed batch contained SHAs (first few): ${batchSHAs.slice(0, 5).join(', ')}...`);
+
+				// Mark all SHAs in this *failed batch* as empty
 				batchSHAs.forEach(sha => {
-					if (!(sha in results)) { // Avoid overwriting if fetched in a previous successful batch (shouldn't happen with current logic but safe)
+					if (!(sha in results)) {
 						results[sha] = "";
 						this.blobCache.set(sha, "");
 					}
 				});
-				// Decide whether to continue with other batches or rethrow the error to halt the sync
-				// For robustness, let's log the error and continue, results will be incomplete
-				// If halting is preferred, uncomment the next line:
-				// throw new OctokitHttpError(`GraphQL batch fetch failed: ${error.message}`, error.status || 500, "getBlobs");
+				// Continue to next batch instead of halting sync
 			}
 		} // End of batch loop
 
-		// Final check: Ensure all *originally* needed SHAs have *some* entry in results, even if fetch failed.
+		// Final check remains the same
 		neededSHAs.forEach(sha => {
 			if (!(sha in results)) {
-				console.warn(`Fit: Blob SHA ${sha} was needed but missing from final results (potential logic error?). Marking as empty.`);
+				console.warn(`Fit: Blob SHA ${sha} was needed but missing from final results. Marking as empty.`);
 				results[sha] = "";
-				if (!this.blobCache.has(sha)) this.blobCache.set(sha, ""); // Cache the miss if not already cached by batch failure
+				if (!this.blobCache.has(sha)) this.blobCache.set(sha, "");
 			}
 		});
 

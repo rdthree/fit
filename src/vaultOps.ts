@@ -1,4 +1,4 @@
-import { TFile, Vault, base64ToArrayBuffer } from "obsidian";
+import { TFile, Vault, base64ToArrayBuffer, TFolder, normalizePath } from "obsidian"; // Added TFolder, normalizePath
 import { FileOpRecord } from "./fitTypes";
 import { Buffer } from 'buffer'; // Use Buffer for robust encoding/decoding
 
@@ -40,98 +40,143 @@ export class VaultOperations implements IVaultOperations {
     }
 
     // if checking a folder, require including the last / in the path param
-    async ensureFolderExists(path: string): Promise<void> {
-        // extract folder path, return empty string is no folder path is matched (exclude the last /)
-        const folderPath = path.match(/^(.*)\//)?.[1] || '';
-        if (folderPath != "") {
-            const folder = this.vault.getAbstractFileByPath(folderPath)
-            if (!folder) {
-                await this.vault.createFolder(folderPath)
-            }
-        }
-    }
+	// --- MODIFIED: ensureFolderExists - More robust error handling ---
+	async ensureFolderExists(filePath: string): Promise<void> {
+		const normalizedFilePath = normalizePath(filePath); // Normalize path first
+		const lastSlash = normalizedFilePath.lastIndexOf('/');
+		if (lastSlash > 0) {
+			const folderPath = normalizedFilePath.substring(0, lastSlash);
+			if (folderPath) {
+				const existing = this.vault.getAbstractFileByPath(folderPath);
 
-	// --- Ensure this handles base64 input correctly ---
+				if (!existing) {
+					// Folder does not exist, try to create it
+					console.log(`Fit: Creating folder: ${folderPath}`); // Log creation attempt
+					try {
+						await this.vault.createFolder(folderPath);
+					} catch (e) {
+						// Check if the error is specifically "Folder already exists"
+						// This might happen due to a race condition or Obsidian internal state
+						if (e.message?.includes("Folder already exists")) {
+							console.warn(`Fit: Attempted to create folder '${folderPath}' but it already exists (Obsidian error ignored).`);
+							// If it already exists, check if it's actually a folder
+							const checkExisting = this.vault.getAbstractFileByPath(folderPath);
+							if (!(checkExisting instanceof TFolder)) {
+								const errorMsg = `Path '${folderPath}' exists but is not a folder (Type: ${checkExisting?.constructor.name}). Cannot proceed.`;
+								console.error(`Fit: ${errorMsg}`);
+								throw new Error(errorMsg); // Throw a specific error
+							}
+							// It exists and is a folder, so we're good.
+						} else {
+							// Re-throw unexpected errors during folder creation
+							console.error(`Fit: Unexpected error creating folder '${folderPath}':`, e);
+							throw e;
+						}
+					}
+				} else if (!(existing instanceof TFolder)) {
+					// Path exists but is not a folder
+					const errorMsg = `Path '${folderPath}' exists but is not a folder (Type: ${existing?.constructor.name}). Cannot ensure folder.`;
+					console.error(`Fit: ${errorMsg}`);
+					throw new Error(errorMsg);
+				}
+				// else: Folder exists and is a TFolder, do nothing.
+			}
+		}
+	}
+
+
+	// --- writeToLocal - Ensure it calls the robust ensureFolderExists ---
 	async writeToLocal(path: string, contentBase64: string): Promise<FileOpRecord> {
-		const file = this.vault.getAbstractFileByPath(path);
+		const normalizedPath = normalizePath(path); // Normalize path
 		let arrayBuffer: ArrayBuffer;
 		try {
-			// Use Buffer for robust conversion
 			arrayBuffer = base64ToArrayBuffer(contentBase64);
 		} catch (e) {
-			console.error(`Error decoding base64 for path: ${path}`, e);
-			// Decide how to handle invalid base64 - skip write, write empty, throw?
-			// Throwing might be safest to alert about data corruption.
-			throw new Error(`Invalid base64 content received for ${path}`);
+			console.error(`Error decoding base64 for path: ${normalizedPath}`, e);
+			throw new Error(`Invalid base64 content received for ${normalizedPath}`);
 		}
 
+		// Ensure folder exists *before* trying to access/create the file
+		await this.ensureFolderExists(normalizedPath);
 
+		const file = this.vault.getAbstractFileByPath(normalizedPath);
 		try {
 			if (file instanceof TFile) {
 				await this.vault.modifyBinary(file, arrayBuffer);
-				return {path, status: "changed"};
+				return {path: normalizedPath, status: "changed"};
 			} else if (!file) {
-				await this.ensureFolderExists(path); // Ensure parent folder exists
-				await this.vault.createBinary(path, arrayBuffer);
-				return {path, status: "created"};
+				// We already ensured the folder exists
+				await this.vault.createBinary(normalizedPath, arrayBuffer);
+				return {path: normalizedPath, status: "created"};
 			} else {
-				// Path exists but is a folder, or something else unexpected
-				console.error(`Cannot write file content to ${path}, it exists but is not a TFile (Type: ${file?.constructor.name})`);
-				throw new Error(`Cannot write file to ${path} as it's not a file.`);
+				// Path exists but is a folder (or something else unexpected)
+				// ensureFolderExists should have thrown if the parent path was a file,
+				// so this implies the final path component itself is a folder.
+				console.error(`Cannot write file content to ${normalizedPath}, path exists but is not a TFile (Type: ${file?.constructor.name})`);
+				throw new Error(`Cannot write file to ${normalizedPath} as it's not a file.`);
 			}
 		} catch (vaultError) {
-			console.error(`Vault operation failed for ${path}:`, vaultError);
-			throw vaultError; // Re-throw vault errors
+			console.error(`Vault operation failed for ${normalizedPath}:`, vaultError);
+			throw vaultError;
 		}
 	}
 
+// ... (Keep updateLocalFiles, createCopyInDir - they use writeToLocal/ensureFolderExists now) ...
 	async updateLocalFiles(
-		addToLocal: {path: string, content: string}[], // content is base64
+		addToLocal: {path: string, content: string}[],
 		deleteFromLocal: Array<string>): Promise<FileOpRecord[]> {
-		// Process writes (content is base64)
-		const writeOpsPromises = addToLocal.map(({path, content}) =>
-			this.writeToLocal(path, content).catch(e => {
-				console.error(`Failed write operation for ${path}:`, e);
-				return null; // Return null on error to filter out later
-			})
-		);
 
-		// Process deletions
-		const deleteOpsPromises = deleteFromLocal.map((path) =>
-			this.deleteFromLocal(path).catch(e => {
-				console.error(`Failed delete operation for ${path}:`, e);
-				return null; // Return null on error
-			})
-		);
+		// Normalize paths before processing
+		const normalizedAddToLocal = addToLocal.map(item => ({ ...item, path: normalizePath(item.path) }));
+		const normalizedDeleteFromLocal = deleteFromLocal.map(normalizePath);
+
+		const writeOpsPromises = normalizedAddToLocal.map(async ({path, content}) => {
+			try {
+				return await this.writeToLocal(path, content);
+			} catch (e) {
+				console.error(`Failed write operation for ${path}:`, e.message);
+				return null; // Mark failure
+			}
+		});
+
+		const deleteOpsPromises = normalizedDeleteFromLocal.map(async (path) => {
+			try {
+				return await this.deleteFromLocal(path);
+			} catch (e) {
+				// Log delete errors but potentially allow sync to continue if delete fails?
+				// Or rely on error being thrown by deleteFromLocal if it's critical.
+				console.error(`Failed delete operation for ${path}:`, e.message);
+				return null; // Mark failure
+			}
+		});
 
 		const results = await Promise.all([...writeOpsPromises, ...deleteOpsPromises]);
-		// Filter out null results from failed operations
-		return results.filter(op => op !== null) as FileOpRecord[];
+		return results.filter((op): op is FileOpRecord => op !== null);
 	}
 
-	// --- Ensure createCopyInDir handles binary correctly ---
 	async createCopyInDir(path: string, copyDir = "_fit"): Promise<void> {
-		const file = await this.getTFile(path); // Use ensured TFile getter
-		const copyData = await this.vault.readBinary(file);
-		const copyPath = `${copyDir}/${path}`;
-
-		await this.ensureFolderExists(copyPath); // Ensure target folder exists
-
-		const existingCopy = this.vault.getAbstractFileByPath(copyPath);
+		const normalizedPath = normalizePath(path);
 		try {
+			const file = await this.getTFile(normalizedPath);
+			const copyData = await this.vault.readBinary(file);
+			const copyPath = normalizePath(`${copyDir}/${normalizedPath}`); // Normalize copy path too
+
+			await this.ensureFolderExists(copyPath); // Ensure target folder exists
+
+			const existingCopy = this.vault.getAbstractFileByPath(copyPath);
+
 			if (existingCopy instanceof TFile) {
 				await this.vault.modifyBinary(existingCopy, copyData);
 			} else if (!existingCopy) {
 				await this.vault.createBinary(copyPath, copyData);
 			} else {
-				// Target path exists but isn't a file (e.g., folder)
 				console.warn(`Cannot create copy at ${copyPath}, path exists but is not a file. Deleting and recreating.`);
-				await this.vault.delete(existingCopy, true); // Force delete folder/other
+				await this.vault.delete(existingCopy, true);
 				await this.vault.createBinary(copyPath, copyData);
 			}
 		} catch (e) {
-			console.error(`Failed to create copy of ${path} at ${copyPath}:`, e);
-			throw e; // Re-throw error
+			console.error(`Failed to create copy of ${normalizedPath} at ${copyDir}:`, e);
+			throw new Error(`Failed to create copy for ${normalizedPath}: ${e.message}`);
 		}
 	}
 }
