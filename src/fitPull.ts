@@ -1,6 +1,8 @@
 import { Fit } from "./fit";
 import { LocalStores } from "main";
 import { FileOpRecord, LocalChange, RemoteChange, RemoteUpdate } from "./fitTypes";
+import { throttleAll } from "./utils";
+
 
 type PrePullCheckResultType = (
     "localCopyUpToDate" | 
@@ -52,15 +54,20 @@ export class FitPull implements IFitPull {
     }
 
     // Get changes from remote, pathShaMap is coupled to the Fit plugin design
-    async getRemoteNonDeletionChangesContent(pathShaMap: Record<string, string>) {
-        const remoteChanges = Object.entries(pathShaMap).map(async ([path, file_sha]) => {
-            const content = await this.fit.getBlob(file_sha);
-            return {path, content};
-        })
-        return await Promise.all(remoteChanges)
-    }
+	async getRemoteNonDeletionChangesContent(pathShaMap: Record<string, string>) {
+		const entries = Object.entries(pathShaMap);
+		return await throttleAll(
+			entries,
+			4,  // Adjust this limit if needed; 4 is a good starting point
+			async ([path, file_sha]) => {
+				const content = await this.fit.getBlob(file_sha);
+				return { path, content };
+			}
+		);
+	}
 
-    async prepareChangesToExecute(remoteChanges: RemoteChange[]) {
+
+	async prepareChangesToExecute(remoteChanges: RemoteChange[]) {
         const deleteFromLocal = remoteChanges.filter(c=>c.status=="REMOVED").map(c=>c.path)
 			const changesToProcess = remoteChanges.filter(c=>c.status!="REMOVED").reduce(
 				(acc, change) => {
