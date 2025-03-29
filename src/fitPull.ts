@@ -55,16 +55,21 @@ export class FitPull implements IFitPull {
 
     // Get changes from remote, pathShaMap is coupled to the Fit plugin design
 	async getRemoteNonDeletionChangesContent(pathShaMap: Record<string, string>) {
+		// Convert the object into an array of [path, file_sha] entries.
 		const entries = Object.entries(pathShaMap);
-		return await throttleAll(
-			entries,
-			4,  // Adjust this limit if needed; 4 is a good starting point
-			async ([path, file_sha]) => {
-				const content = await this.fit.getBlob(file_sha);
-				return { path, content };
-			}
-		);
+		// Extract all blob SHAs.
+		const blobSHAs = entries.map(([_, sha]) => sha);
+
+		// Use the new getBlobs function to fetch all blobs at once.
+		const blobs = await this.fit.getBlobs(blobSHAs);
+
+		// Map back the results to an array of objects with path and content.
+		return entries.map(([path, sha]) => ({
+			path,
+			content: blobs[sha] || ""
+		}));
 	}
+
 
 
 	async prepareChangesToExecute(remoteChanges: RemoteChange[]) {
