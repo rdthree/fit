@@ -487,77 +487,106 @@ export class Fit implements IFit {
 
 	// NEW FUNCTION: Bundled blob retrieval using GraphQL
 	// --- MODIFIED: getBlobs (GraphQL) - Use and Populate Cache ---
+// --- MODIFIED: getBlobs (GraphQL) - Added Batching for 100 ID Limit ---
 	async getBlobs(blobSHAs: string[]): Promise<{ [sha: string]: string }> {
-		const neededSHAs = blobSHAs.filter(sha => !this.blobCache.has(sha));
+		// Filter out invalid SHAs early (e.g., empty strings or nulls if they somehow slip in)
+		const validBlobSHAs = blobSHAs.filter(sha => sha && typeof sha === 'string' && sha.length > 0);
+
+		const neededSHAs = validBlobSHAs.filter(sha => !this.blobCache.has(sha));
 		const results: { [sha: string]: string } = {};
 
 		// Populate results from cache first
-		blobSHAs.forEach(sha => {
+		validBlobSHAs.forEach(sha => {
 			if (this.blobCache.has(sha)) {
 				results[sha] = this.blobCache.get(sha) as string;
 			}
 		});
 
 		if (neededSHAs.length === 0) {
-			// console.log("Fit: All blobs requested were already in cache."); // Optional logging
+			// console.log("Fit: All blobs requested were already in cache.");
 			return results;
 		}
 
-		// console.log(`Fit: Fetching ${neededSHAs.length} blobs via GraphQL.`); // Optional logging
+		console.log(`Fit: Need to fetch ${neededSHAs.length} blobs via GraphQL.`);
 
-		// Convert needed SHAs to GraphQL node IDs
-		// Use Buffer for reliable base64 encoding
-		const ids = neededSHAs.map(sha =>
-				Buffer.from(`blob:${sha}`).toString('base64') // Standard GraphQL ID format for blobs might vary, check docs/experiment. Common is `blob:<sha>` or repo-specific prefix. Let's assume `blob:<sha>` for now. Adjust if needed.
-			// Alternative common format: `010blob${sha}` -> Buffer.from(`010blob${sha}`).toString('base64')
-		);
+		// --- Batching Logic ---
+		const BATCH_SIZE = 95; // Stay safely under the 100 limit
+		for (let i = 0; i < neededSHAs.length; i += BATCH_SIZE) {
+			const batchSHAs = neededSHAs.slice(i, i + BATCH_SIZE);
+			console.log(`Fit: Fetching GraphQL batch ${Math.floor(i / BATCH_SIZE) + 1} with ${batchSHAs.length} IDs.`);
 
+			// Convert batch SHAs to GraphQL node IDs
+			const ids = batchSHAs.map(sha =>
+				Buffer.from(`blob:${sha}`).toString('base64') // Assuming this format is correct
+			);
 
-		// Build the GraphQL query
-		const query = `
-        query ($ids: [ID!]!) {
-            nodes(ids: $ids) {
-                ... on Blob {
-                    oid # The SHA
-                    byteSize # Good to check if needed
-                    text # Content for text files
-                    isBinary # To know if we need to handle base64
-                    # If handling binary: might need different fields or handle 'text' as base64
+			// Build the GraphQL query
+			const query = `
+            query ($ids: [ID!]!) {
+                nodes(ids: $ids) {
+                    ... on Blob {
+                        oid # The SHA
+                        # byteSize
+                        text # Content for text files (may be null for binary)
+                        isBinary
+                    }
                 }
-            }
-        }
-        `; // Note: `text` might return null for binary files. GitHub GraphQL might require different handling/fields for binary content retrieval if `text` doesn't provide base64. Check API docs. Assuming `text` provides UTF-8 or Base64 for now.
+            }`;
+			const variables = { ids };
 
-		const variables = { ids };
+			try {
+				// Call the GraphQL endpoint (throttled automatically by throttledRequest)
+				const response: { nodes: Array<{ oid: string; text: string | null; isBinary: boolean } | null> } =
+					await this.throttledRequest(() => this.octokit.graphql(query, variables));
 
-		// Call the GraphQL endpoint (throttled)
-		const response: { nodes: Array<{ oid: string; text: string; isBinary: boolean } | null> } =
-			await this.throttledRequest(() => this.octokit.graphql(query, variables));
+				// Process results for this batch and update cache
+				response.nodes.forEach(node => {
+					if (node?.oid) {
+						const content = node.text ?? ""; // Default to empty if text is null
+						results[node.oid] = content;
+						this.blobCache.set(node.oid, content);
+						if (node.text === null) {
+							console.warn(`Fit: GraphQL node for SHA ${node.oid} returned null text. Content might be binary or too large.`);
+						}
+					}
+				});
 
-		// Process results and update cache
-		response.nodes.forEach(node => {
-			if (node && node.oid && node.text !== null) { // Check text is not null
-				const content = node.text; // Assuming text is the content (UTF-8 or Base64 if binary was requested appropriately)
-				results[node.oid] = content;
-				this.blobCache.set(node.oid, content); // Update cache
-			} else if (node && node.oid) {
-				// Handle cases where text is null (e.g., potentially large binary files not retrieved via 'text')
-				console.warn(`Fit: GraphQL node for SHA ${node.oid} returned null text. Content might be binary or too large for this query field.`);
-				// Mark as fetched but empty in cache, or leave out? Let's mark empty for now.
-				results[node.oid] = ""; // Indicate fetch attempt but no content retrieved
-				this.blobCache.set(node.oid, "");
+				// Check for any SHAs in the *batch* that weren't returned
+				batchSHAs.forEach(sha => {
+					if (!(sha in results)) {
+						// This might happen if the blob ID format was wrong, or the blob truly doesn't exist
+						console.warn(`Fit: Blob SHA ${sha} from batch not found in GraphQL response.`);
+						results[sha] = ""; // Mark as fetched but empty/not found
+						this.blobCache.set(sha, "");
+					}
+				});
+
+			} catch (error) {
+				console.error(`Fit: GraphQL batch fetch failed (Batch starting index ${i}):`, error);
+				// Mark all SHAs in this *failed batch* as empty in results and cache to avoid retrying them individually
+				batchSHAs.forEach(sha => {
+					if (!(sha in results)) { // Avoid overwriting if fetched in a previous successful batch (shouldn't happen with current logic but safe)
+						results[sha] = "";
+						this.blobCache.set(sha, "");
+					}
+				});
+				// Decide whether to continue with other batches or rethrow the error to halt the sync
+				// For robustness, let's log the error and continue, results will be incomplete
+				// If halting is preferred, uncomment the next line:
+				// throw new OctokitHttpError(`GraphQL batch fetch failed: ${error.message}`, error.status || 500, "getBlobs");
 			}
-		});
+		} // End of batch loop
 
-		// Check if any requested SHAs were not returned by GraphQL (e.g., invalid ID format, non-existent blobs)
+		// Final check: Ensure all *originally* needed SHAs have *some* entry in results, even if fetch failed.
 		neededSHAs.forEach(sha => {
 			if (!(sha in results)) {
-				console.warn(`Fit: Blob SHA ${sha} requested via GraphQL but not found in response.`);
-				results[sha] = ""; // Or handle as error
-				this.blobCache.set(sha, ""); // Cache the miss
+				console.warn(`Fit: Blob SHA ${sha} was needed but missing from final results (potential logic error?). Marking as empty.`);
+				results[sha] = "";
+				if (!this.blobCache.has(sha)) this.blobCache.set(sha, ""); // Cache the miss if not already cached by batch failure
 			}
 		});
 
 		return results;
 	}
-}
+
+} // End of Fit class
