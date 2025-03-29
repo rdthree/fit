@@ -401,4 +401,42 @@ export class Fit implements IFit {
         })
         return blob.content
     }
+
+	// NEW FUNCTION: Bundled blob retrieval using GraphQL
+	async getBlobs(blobSHAs: string[]): Promise<{ [sha: string]: string }> {
+		// Convert each blob SHA into its global node ID.
+		// GitHub’s pattern is to prefix with "010blob" and then base64 encode.
+		const ids = blobSHAs.map(sha =>
+			Buffer.from('010blob' + sha).toString('base64')
+		);
+
+		// Build the GraphQL query. This uses the 'nodes' field to fetch multiple objects by ID.
+		const query = `
+        query ($ids: [ID!]!) {
+            nodes(ids: $ids) {
+                ... on Blob {
+                    oid
+                    text
+                }
+            }
+        }
+    `;
+		const variables = { ids };
+
+		// Call the GraphQL endpoint via octokit.
+		// Note: Octokit supports GraphQL via `octokit.graphql(query, variables)`
+		const response: { nodes: Array<{ oid: string; text: string } | null> } =
+			await this.octokit.graphql(query, variables);
+
+		// Map the results: use the oid (which should match your original SHA) as key.
+		const blobs: { [sha: string]: string } = {};
+		response.nodes.forEach(node => {
+			if (node && node.oid && node.text) {
+				// node.oid should equal the original SHA if the conversion is correct.
+				blobs[node.oid] = node.text;
+			}
+		});
+		return blobs;
+	}
+
 }
